@@ -25,7 +25,7 @@ runs:
   - name: Download
     uses: robinraju/release-downloader@v1.10
     with:
-      repository: geode-sdk/cli
+      repository: hiimjustin000/cli
       latest: ${{ inputs.version == 'latest' }}
       tag: ${{ inputs.version != 'latest' && inputs.version || '' }}
       fileName: '*-${{ steps.platform.outputs.host }}.zip'
