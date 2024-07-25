@@ -521,7 +521,13 @@ fn switch_to_tag(config: &mut Config, repo: &Repository) {
 		let ref_str = format!("refs/tags/v{strip_ver}");
 		if repo.find_reference(ref_str.as_str()).is_err() {
 			config.sdk_version = None;
-			fatal!("Unable to find tag {ver}");
+			warn!("Unable to find tag {ver}, finding commit instead");
+			if repo.find_commit_by_prefix(&ver).is_err() {
+				fatal!("Unable to find tag or commit {ver}");
+			}
+			switch_to_ref(repo, &ver);
+			info!("Switched to {ver}");
+			return;
 		}
 		switch_to_ref(repo, ref_str.as_str());
 		info!("Switched to {ver}");
