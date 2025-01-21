@@ -36,6 +36,28 @@ struct GithubReleaseResponse {
 	assets: Vec<GithubReleaseAsset>,
 }
 
+#[derive(Deserialize)]
+struct GithubActionArtifact {
+	id: u64,
+	name: String,
+}
+
+#[derive(Deserialize)]
+struct GithubArtifactResponse {
+	artifacts: Vec<GithubActionArtifact>,
+}
+
+#[derive(Deserialize)]
+struct GithubWorkflowRun {
+	check_suite_id: u64,
+	artifacts_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubWorkflowResponse {
+	workflow_runs: Vec<GithubWorkflowRun>,
+}
+
 #[allow(unused)]
 struct LinuxShellConfig {
 	profile: String,
@@ -83,6 +105,9 @@ pub enum Sdk {
 		/// Specify version to install
 		#[clap(long, short)]
 		version: Option<String>,
+		/// Specify commit to install, full SHA
+		#[clap(long, short)]
+		commit: Option<String>,
 	},
 
 	/// Uninstall SDK
@@ -464,6 +489,8 @@ fn update(config: &mut Config, branch: Option<String>) {
 		}
 	};
 
+	config.sdk_sha = None;
+
 	info!("Updating SDK");
 
 	// Initialize repository
@@ -526,7 +553,16 @@ fn switch_to_tag(config: &mut Config, repo: &Repository) {
 		let ref_str = format!("refs/tags/v{strip_ver}");
 		if repo.find_reference(ref_str.as_str()).is_err() {
 			config.sdk_version = None;
-			fatal!("Unable to find tag {ver}");
+			warn!("Unable to find tag {ver}, finding commit instead");
+			let found_commit = repo.find_commit_by_prefix(&ver);
+			if found_commit.is_err() {
+				fatal!("Unable to find tag or commit {ver}");
+			}
+			switch_to_ref(repo, &ver);
+			let commit_id = found_commit.unwrap().id().to_string();
+			config.sdk_sha = Some(commit_id.clone());
+			info!("Switched to {commit_id}");
+			return;
 		}
 		switch_to_ref(repo, ref_str.as_str());
 		info!("Switched to {ver}");
@@ -557,13 +593,57 @@ fn switch_to_tag(config: &mut Config, repo: &Repository) {
 	done!("Updated head to v{}", latest_version.unwrap());
 }
 
-fn install_binaries(config: &mut Config, platform: Option<String>, version: Option<String>) {
+fn process_asset(asset_name: &str, asset_url: &str, platform: &str) -> Option<String> {
+	// skip installers
+	if asset_name.to_lowercase().contains("installer") {
+		return None;
+	}
+
+	// skip resources
+	if !asset_name.to_lowercase().contains("geode") {
+		return None;
+	}
+
+	match platform {
+		"windows" | "linux" | "win" => {
+			if asset_name.to_lowercase().contains("-win") {
+				info!("Found binaries for platform Windows");
+				return Some(asset_url.into());
+			}
+		}
+		"macos" | "mac" => {
+			if asset_name.to_lowercase().contains("-mac") {
+				info!("Found binaries for platform MacOS");
+				return Some(asset_url.into());
+			}
+		}
+		os => {
+			if asset_name.to_lowercase().contains(&format!("-{os}")) {
+				info!("Found binaries for platform \"{os}\"");
+				return Some(asset_url.into());
+			}
+		}
+	}
+
+	None
+}
+
+fn install_binaries(config: &mut Config, platform: Option<String>, version: Option<String>, commit: Option<String>) {
 	let release_tag: String;
+	let release_commit: String;
 	let target_dir: PathBuf;
 	if config.sdk_nightly {
 		info!("Installing nightly binaries");
 		release_tag = "nightly".into();
+		release_commit = "".into();
 		target_dir = Config::sdk_path().join("bin/nightly");
+	} else if config.sdk_sha.is_some() {
+		info!("Installing binaries for commit {}", config.sdk_sha.as_deref().unwrap());
+		release_tag = "".into();
+		release_commit = config.sdk_sha.as_deref().unwrap().to_string();
+		let mut stripped_ver = get_version();
+		stripped_ver.pre = Prerelease::EMPTY;
+		target_dir = Config::sdk_path().join(format!("bin/{}", stripped_ver));
 	} else if version.is_some() {
 		let ver = Version::parse(
 			version
@@ -576,71 +656,97 @@ fn install_binaries(config: &mut Config, platform: Option<String>, version: Opti
 		info!("Installing binaries for {}", ver);
 
 		release_tag = format!("v{}", ver);
+		release_commit = "".into();
 		let mut stripped_ver = ver.clone();
+		stripped_ver.pre = Prerelease::EMPTY;
+		target_dir = Config::sdk_path().join(format!("bin/{}", stripped_ver));
+	} else if commit.is_some() {
+		info!("Installing binaries for commit {}", commit.as_deref().unwrap());
+		release_tag = "".into();
+		release_commit = commit.as_deref().unwrap().to_string();
+		let mut stripped_ver = get_version();
 		stripped_ver.pre = Prerelease::EMPTY;
 		target_dir = Config::sdk_path().join(format!("bin/{}", stripped_ver));
 	} else {
 		let ver = get_version();
 		info!("Installing binaries for {}", ver);
 		release_tag = format!("v{}", ver);
+		release_commit = "".into();
 		// remove any -beta or -alpha suffixes as geode cmake doesn't care about those
 		let mut stripped_ver = ver.clone();
 		stripped_ver.pre = Prerelease::EMPTY;
 		target_dir = Config::sdk_path().join(format!("bin/{}", stripped_ver));
 	}
 
-	let res = reqwest::blocking::Client::new()
-		.get(format!(
-			"https://api.github.com/repos/geode-sdk/geode/releases/tags/{}",
-			release_tag
-		))
-		.header(USER_AGENT, "github_api/1.0")
-		.header(
-			AUTHORIZATION,
-			std::env::var("GITHUB_TOKEN").map_or("".into(), |token| format!("Bearer {token}")),
-		)
-		.send()
-		.nice_unwrap("Unable to get download info from GitHub")
-		.json::<GithubReleaseResponse>()
-		.nice_unwrap(format!("Could not parse Geode release \"{}\"", release_tag));
-
 	let mut target_url: Option<String> = None;
 	let platform = platform
 		.as_deref()
 		.unwrap_or(env::consts::OS)
 		.to_lowercase();
-	for asset in res.assets {
-		// skip installers
-		if asset.name.to_lowercase().contains("installer") {
-			continue;
+
+	if release_tag.is_empty() {
+		let res = reqwest::blocking::Client::new()
+			.get(format!(
+				"https://api.github.com/repos/geode-sdk/geode/actions/workflows/build.yml/runs?head_sha={}",
+				release_commit
+			))
+			.header(USER_AGENT, "github_api/1.0")
+			.header(
+				AUTHORIZATION,
+				std::env::var("GITHUB_TOKEN").map_or("".into(), |token| format!("Bearer {token}")),
+			)
+			.send()
+			.nice_unwrap("Unable to get commit info from GitHub")
+			.json::<GithubWorkflowResponse>()
+			.nice_unwrap("Could not parse Geode commit");
+
+		if res.workflow_runs.is_empty() {
+			fatal!("No workflow runs found for commit {}", release_commit);
 		}
 
-		// skip resources
-		if !asset.name.to_lowercase().contains("geode") {
-			continue;
-		}
+		let artifacts = reqwest::blocking::Client::new()
+			.get(&res.workflow_runs[0].artifacts_url)
+			.header(USER_AGENT, "github_api/1.0")
+			.header(
+				AUTHORIZATION,
+				std::env::var("GITHUB_TOKEN").map_or("".into(), |token| format!("Bearer {token}")),
+			)
+			.send()
+			.nice_unwrap("Unable to get artifacts info from GitHub")
+			.json::<GithubArtifactResponse>()
+			.nice_unwrap("Could not parse Geode artifacts");
 
-		match platform.as_str() {
-			"windows" | "linux" | "win" => {
-				if asset.name.to_lowercase().contains("-win") {
-					target_url = Some(asset.browser_download_url);
-					info!("Found binaries for platform Windows");
-					break;
-				}
+		for artifact in artifacts.artifacts {
+			if let Some(url) = process_asset(
+				&artifact.name,
+				&format!("https://nightly.link/geode-sdk/geode/suites/{}/artifacts/{}",
+					res.workflow_runs[0].check_suite_id, artifact.id),
+				&platform,
+			) {
+				target_url = Some(url);
+				break;
 			}
-			"macos" | "mac" => {
-				if asset.name.to_lowercase().contains("-mac") {
-					target_url = Some(asset.browser_download_url);
-					info!("Found binaries for platform MacOS");
-					break;
-				}
-			}
-			os => {
-				if asset.name.to_lowercase().contains(&format!("-{os}")) {
-					target_url = Some(asset.browser_download_url);
-					info!("Found binaries for platform \"{os}\"");
-					break;
-				}
+		}
+	} else {
+		let res = reqwest::blocking::Client::new()
+			.get(format!(
+				"https://api.github.com/repos/geode-sdk/geode/releases/tags/{}",
+				release_tag
+			))
+			.header(USER_AGENT, "github_api/1.0")
+			.header(
+				AUTHORIZATION,
+				std::env::var("GITHUB_TOKEN").map_or("".into(), |token| format!("Bearer {token}")),
+			)
+			.send()
+			.nice_unwrap("Unable to get download info from GitHub")
+			.json::<GithubReleaseResponse>()
+			.nice_unwrap(format!("Could not parse Geode release \"{}\"", release_tag));
+
+		for asset in res.assets {
+			if let Some(url) = process_asset(&asset.name, &asset.browser_download_url, &platform) {
+				target_url = Some(url);
+				break;
 			}
 		}
 	}
@@ -957,9 +1063,9 @@ pub fn subcommand(cmd: Sdk) {
 			config.save();
 		}
 		Sdk::Version => info!("Geode SDK version: {}", get_version()),
-		Sdk::InstallBinaries { platform, version } => {
+		Sdk::InstallBinaries { platform, version, commit } => {
 			let mut config = Config::new().assert_is_setup();
-			install_binaries(&mut config, platform, version);
+			install_binaries(&mut config, platform, version, commit);
 			config.save();
 		}
 

@@ -28,6 +28,7 @@ pub struct Config {
 	pub default_developer: Option<String>,
 	pub sdk_nightly: bool,
 	pub sdk_version: Option<String>,
+	pub sdk_sha: Option<String>,
 	pub index_token: Option<String>,
 	#[serde(default = "default_index_url")]
 	pub index_url: String,
@@ -217,6 +218,7 @@ impl Config {
 			default_developer: None,
 			sdk_nightly: false,
 			sdk_version: None,
+			sdk_sha: None,
 			other: HashMap::<String, Value>::new(),
 			index_token: None,
 			index_url: "https://api.geode-sdk.org".to_string(),
