@@ -105,7 +105,7 @@ pub trait NiceUnwrap<T> {
 
 impl<T, E: Display> NiceUnwrap<T> for Result<T, E> {
 	fn nice_unwrap<S: Display>(self, text: S) -> T {
-		self.unwrap_or_else(|e| fatal!("{}: {}", text, e))
+		self.unwrap_or_else(|e| fatal!("{}: {:?}", text, e))
 	}
 }
 
